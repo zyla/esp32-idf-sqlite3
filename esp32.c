@@ -100,6 +100,7 @@ typedef struct esp32_file {
 	FILE *fd;
 	filecache_t *cache;
 	char name[esp32_DEFAULT_MAXNAMESIZE];
+    int flags;
 } esp32_file;
 
 sqlite3_vfs  esp32Vfs = {
@@ -355,14 +356,28 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
 	char mode[5];
 	esp32_file *p = (esp32_file*) file;
 
-	strcpy(mode, "r");
+	memset (p, 0, sizeof(esp32_file));
+    p->flags = flags;
+
 	if ( path == NULL ) return SQLITE_IOERR;
-	dbg_printf("esp32_Open: 0o %s %s\n", path, mode);
+
+	strncpy (p->name, path, esp32_DEFAULT_MAXNAMESIZE);
+	p->name[esp32_DEFAULT_MAXNAMESIZE-1] = '\0';
+
+	char *j_start = strstr(p->name, "-journal");
+	if(j_start) {
+		j_start[0] = 'J';
+		j_start[1] = '\0';
+	}
+
+	strcpy(mode, "r");
+
+	dbg_printf("esp32_Open: 0o %s %s\n", p->name, mode);
 	if( flags&SQLITE_OPEN_READONLY ) 
 		strcpy(mode, "r");
 	if( flags&SQLITE_OPEN_READWRITE || flags&SQLITE_OPEN_MAIN_JOURNAL ) {
 		int result;
-		if (SQLITE_OK != esp32_Access(vfs, path, flags, &result))
+		if (SQLITE_OK != esp32_Access(vfs, p->name, flags, &result))
 			return SQLITE_CANTOPEN;
 
 		if (result == 1)
@@ -371,12 +386,9 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
             strcpy(mode, "w+");
 	}
 
-	dbg_printf("esp32_Open: 1o %s %s\n", path, mode);
-	memset (p, 0, sizeof(esp32_file));
+	dbg_printf("esp32_Open: 1o %s %s\n", p->name, mode);
 
-    strncpy (p->name, path, esp32_DEFAULT_MAXNAMESIZE);
-	p->name[esp32_DEFAULT_MAXNAMESIZE-1] = '\0';
-
+	/*
 	if( flags&SQLITE_OPEN_MAIN_JOURNAL ) {
 		p->fd = 0;
 		p->cache = (filecache_t *) sqlite3_malloc(sizeof (filecache_t));
@@ -388,8 +400,9 @@ int esp32_Open( sqlite3_vfs * vfs, const char * path, sqlite3_file * file, int f
 		dbg_printf("esp32_Open: 2o %s MEM OK\n", p->name);
 		return SQLITE_OK;
 	}
+	*/
 
-	p->fd = fopen(path, mode);
+	p->fd = fopen(p->name, mode);
     if ( p->fd <= 0 ) {
 		return SQLITE_CANTOPEN;
 	}
@@ -405,6 +418,11 @@ int esp32_Close(sqlite3_file *id)
 
 	int rc = fclose(file->fd);
 	dbg_printf("esp32_Close: %s %d\n", file->name, rc);
+
+    if(!rc && (file->flags & SQLITE_OPEN_DELETEONCLOSE)) {
+        return esp32_Delete(NULL, file->name, 0);
+    }
+
 	return rc ? SQLITE_IOERR_CLOSE : SQLITE_OK;
 }
 
@@ -452,7 +470,7 @@ int esp32_Write(sqlite3_file *id, const void *buffer, int amount, sqlite3_int64 
 
 	nWrite = fwrite(buffer, 1, amount, file->fd);
 	if ( nWrite != amount ) {
-		dbg_printf("esp32_Write: 2w %s %u %d\n", file->name, nWrite, amount);
+		dbg_printf("esp32_Write: 2w %s FAIL %u %d\n", file->name, nWrite, amount);
 		return SQLITE_IOERR_WRITE;
 	}
 
@@ -463,11 +481,11 @@ int esp32_Write(sqlite3_file *id, const void *buffer, int amount, sqlite3_int64 
 int esp32_Truncate(sqlite3_file *id, sqlite3_int64 bytes)
 {
 	esp32_file *file = (esp32_file*) id;
-	//int fno = fileno(file->fd);
-	//if (fno == -1)
-	//	return SQLITE_IOERR_TRUNCATE;
-	//if (ftruncate(fno, 0))
-	//	return SQLITE_IOERR_TRUNCATE;
+	int fno = fileno(file->fd);
+	if (fno == -1)
+		return SQLITE_IOERR_TRUNCATE;
+	if (ftruncate(fno, 0))
+		return SQLITE_IOERR_TRUNCATE;
 
 	dbg_printf("esp32_Truncate:\n");
 	return SQLITE_OK;
@@ -475,11 +493,22 @@ int esp32_Truncate(sqlite3_file *id, sqlite3_int64 bytes)
 
 int esp32_Delete( sqlite3_vfs * vfs, const char * path, int syncDir )
 {
-	int32_t rc = remove( path );
+
+	char name[esp32_DEFAULT_MAXNAMESIZE];
+	strncpy (name, path, esp32_DEFAULT_MAXNAMESIZE);
+	name[esp32_DEFAULT_MAXNAMESIZE-1] = '\0';
+
+	char *j_start = strstr(name, "-journal");
+	if(j_start) {
+		j_start[0] = 'J';
+		j_start[1] = '\0';
+	}
+
+	int32_t rc = remove( name );
 	if (rc)
 		return SQLITE_IOERR_DELETE;
 
-	dbg_printf("esp32_Delete: %s OK\n", path);
+	dbg_printf("esp32_Delete: %s OK\n", name);
 	return SQLITE_OK;
 }
 
@@ -511,12 +540,22 @@ int esp32_Sync(sqlite3_file *id, int flags)
 
 int esp32_Access( sqlite3_vfs * vfs, const char * path, int flags, int * result )
 {
+	char name[esp32_DEFAULT_MAXNAMESIZE];
+	strncpy (name, path, esp32_DEFAULT_MAXNAMESIZE);
+	name[esp32_DEFAULT_MAXNAMESIZE-1] = '\0';
+
+	char *j_start = strstr(name, "-journal");
+	if(j_start) {
+		j_start[0] = 'J';
+		j_start[1] = '\0';
+	}
+
 	struct stat st;
 	memset(&st, 0, sizeof(struct stat));
-	int rc = stat( path, &st );
+	int rc = stat( name, &st );
 	*result = ( rc != -1 );
 
-	dbg_printf("esp32_Access: %s %d %d %ld\n", path, *result, rc, st.st_size);
+	dbg_printf("esp32_Access: %s %d %d %ld\n", name, *result, rc, st.st_size);
 	return SQLITE_OK;
 }
 
